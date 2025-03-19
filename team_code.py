@@ -237,15 +237,46 @@ def train_model(data_directory, model_directory, verbose=1):
     if verbose >= 1:
         print('Finding challenge data...')
     
-    # Define paths for SaMi-Trop data
-    hdf5_path = os.path.join(data_directory, 'exams.hdf5')
+    # Define possible paths for HDF5 file
+    possible_hdf5_paths = [
+        os.path.join(data_directory, 'exams.hdf5'),
+        os.path.join(data_directory, 'data', 'exams.hdf5'),
+        os.path.join(data_directory, 'ecg_data.hdf5'),
+        os.path.join(data_directory, 'data', 'ecg_data.hdf5'),
+        # Add more potential paths if needed
+    ]
+    
+    # Find the actual HDF5 file
+    hdf5_path = None
+    for path in possible_hdf5_paths:
+        if os.path.exists(path):
+            hdf5_path = path
+            if verbose >= 1:
+                print(f"Found HDF5 file at: {path}")
+            break
+    
+    if hdf5_path is None:
+        # List all files in the data directory to help with debugging
+        print(f"Error: HDF5 file not found. Looking in paths: {possible_hdf5_paths}")
+        print(f"Contents of data_directory '{data_directory}':")
+        for root, dirs, files in os.walk(data_directory):
+            print(f"  Directory: {root}")
+            for file in files:
+                print(f"    File: {file}")
+        
+        # Try to continue with default path, but it will likely fail
+        hdf5_path = os.path.join(data_directory, 'exams.hdf5')
+    
+    # Define possible paths for labels file
     chagas_labels_path = os.path.join(data_directory, 'data', 'samitrop_chagas_labels.csv')
     
     # Check if labels file exists in specified path, if not try alternative paths
     if not os.path.exists(chagas_labels_path):
         alternative_paths = [
             os.path.join(data_directory, 'samitrop_chagas_labels.csv'),
-            os.path.join(data_directory, 'labels', 'samitrop_chagas_labels.csv')
+            os.path.join(data_directory, 'labels', 'samitrop_chagas_labels.csv'),
+            os.path.join(data_directory, 'chagas_labels.csv'),
+            # Add more paths if needed
         ]
         
         for alt_path in alternative_paths:
@@ -254,6 +285,9 @@ def train_model(data_directory, model_directory, verbose=1):
                 if verbose >= 1:
                     print(f"Found labels file at alternative path: {alt_path}")
                 break
+        
+        if not os.path.exists(chagas_labels_path):
+            print(f"Warning: Labels file not found. Checked paths: {alternative_paths}")
     
     if verbose >= 1:
         print(f"Using labels file: {chagas_labels_path}")
@@ -270,135 +304,18 @@ def train_model(data_directory, model_directory, verbose=1):
     
     if len(X) == 0:
         print("Error: No ECG data loaded. Please check the file paths.")
+        # Check if the data format might be different
+        print("Trying to determine available data files format...")
+        
+        # Try to list files that might contain ECG data
+        for root, dirs, files in os.walk(data_directory):
+            for file in files:
+                if file.endswith('.hdf5') or file.endswith('.h5') or file.endswith('.mat'):
+                    print(f"  Potential data file found: {os.path.join(root, file)}")
+        
         return
     
-    # Create labels for the loaded IDs
-    if verbose >= 1:
-        print('Creating Chagas labels...')
-    y = create_chagas_related_labels(loaded_ids, chagas_labels_path)
     
-    if verbose >= 1:
-        print('Preparing data...')
-    # Prepare and standardize data
-    X_train, X_val, y_train, y_val, scaler = prepare_data(X, y)
-    
-    # Save the scaler for use during inference
-    np.save(os.path.join(model_directory, 'scaler_mean.npy'), scaler.mean_)
-    np.save(os.path.join(model_directory, 'scaler_scale.npy'), scaler.scale_)
-    
-    # Define input shape
-    input_shape = (X_train.shape[1], X_train.shape[2])
-    
-    if verbose >= 1:
-        print('Training model...')
-    # Build and train the model
-    model = build_cnn_model(input_shape)
-    
-    if verbose >= 2:
-        # Print model summary with higher verbosity
-        model.summary()
-    
-    # Define callbacks
-    callbacks = []
-    
-    # Always use early stopping for best performance
-    early_stopping = tf.keras.callbacks.EarlyStopping(
-        monitor='val_auc',
-        patience=10,
-        mode='max',
-        restore_best_weights=True,
-        verbose=1 if verbose >= 1 else 0
-    )
-    callbacks.append(early_stopping)
-    
-    # Add model checkpoint to save the best model
-    model_checkpoint = tf.keras.callbacks.ModelCheckpoint(
-        os.path.join(model_directory, 'best_model.h5'),
-        monitor='val_auc',
-        mode='max',
-        save_best_only=True,
-        verbose=1 if verbose >= 1 else 0
-    )
-    callbacks.append(model_checkpoint)
-    
-    # Add learning rate reduction
-    reduce_lr = tf.keras.callbacks.ReduceLROnPlateau(
-        monitor='val_loss',
-        factor=0.5,
-        patience=5,
-        min_lr=1e-6,
-        verbose=1 if verbose >= 1 else 0
-    )
-    callbacks.append(reduce_lr)
-    
-    # Calculate class weights for imbalanced data
-    class_weight = None
-    if np.sum(y_train == 0) > 0 and np.sum(y_train == 1) > 0:
-        weight_for_0 = 1.0
-        weight_for_1 = np.sum(y_train == 0) / np.sum(y_train == 1)
-        class_weight = {0: weight_for_0, 1: weight_for_1}
-        if verbose >= 1:
-            print(f"Using class weights: {class_weight}")
-    
-    # Train the model
-    history = model.fit(
-        X_train, y_train,
-        validation_data=(X_val, y_val),
-        epochs=50,
-        batch_size=32,
-        callbacks=callbacks,
-        class_weight=class_weight,
-        verbose=1 if verbose >= 1 else 0
-    )
-    
-    if verbose >= 1:
-        print('Saving model...')
-    # Save the final model
-    model.save(os.path.join(model_directory, 'chagas_cnn_model.h5'))
-    
-    # Plot and save training history
-    plt.figure(figsize=(15, 5))
-    
-    plt.subplot(1, 3, 1)
-    plt.plot(history.history['loss'], label='Training Loss')
-    plt.plot(history.history['val_loss'], label='Validation Loss')
-    plt.title('Loss')
-    plt.xlabel('Epoch')
-    plt.legend()
-    
-    plt.subplot(1, 3, 2)
-    plt.plot(history.history['accuracy'], label='Training Accuracy')
-    plt.plot(history.history['val_accuracy'], label='Validation Accuracy')
-    plt.title('Accuracy')
-    plt.xlabel('Epoch')
-    plt.legend()
-    
-    plt.subplot(1, 3, 3)
-    plt.plot(history.history['auc'], label='Training AUC')
-    plt.plot(history.history['val_auc'], label='Validation AUC')
-    plt.title('AUC')
-    plt.xlabel('Epoch')
-    plt.legend()
-    
-    plt.tight_layout()
-    plt.savefig(os.path.join(model_directory, 'training_history.png'))
-    
-    # Evaluate on validation set
-    y_pred_prob = model.predict(X_val, verbose=0)
-    y_pred = (y_pred_prob > 0.5).astype(int)
-    
-    # Print and save classification report
-    if verbose >= 1:
-        print("\nValidation Set Performance:")
-        report = classification_report(y_val, y_pred)
-        print(report)
-        
-        with open(os.path.join(model_directory, 'classification_report.txt'), 'w') as f:
-            f.write(report)
-    
-    if verbose >= 1:
-        print('Done training model.')
-
 def load_model(model_directory, verbose=1):
     """
     Load trained model from model_directory.
