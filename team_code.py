@@ -105,20 +105,91 @@ def load_raw_data(df, sampling_rate, data_path):
                 all_tracings = np.array(hdf['tracings'])
                 print(f"Loaded tracings with shape: {all_tracings.shape}")
                 
-                # Process tracings as before...
-                # ... [rest of the existing 'tracings' code]
+                # Determine number of records
+                n_records = all_tracings.shape[0]
+                print(f"Number of ECG records: {n_records}")
                 
+                # Generate sequential IDs if needed
+                if df is not None and 'exam_id' in df.columns and len(df) == n_records:
+                    exam_ids = df['exam_id'].values
+                    print("Using exam IDs from metadata DataFrame")
+                else:
+                    # For SaMi-Trop, we want to use sequential IDs starting from 1
+                    exam_ids = [i+1 for i in range(n_records)]
+                    print("Using generated sequential exam IDs (1 to n)")
+                
+                # Loop through each record
+                for i in range(n_records):
+                    # Display progress
+                    if (i+1) % 100 == 0 or i == n_records - 1:
+                        print(f"Processed {i+1}/{n_records} records")
+                    
+                    try:
+                        # Get the ECG for this record
+                        signal = all_tracings[i]
+                        
+                        # Check if we have 12-lead ECG
+                        if len(signal.shape) > 1 and signal.shape[1] == 12:
+                            # Standardize to a fixed length if needed
+                            target_length = 4000  # 10 seconds at 400Hz
+                            
+                            if signal.shape[0] > target_length:
+                                # Trim to target length
+                                signal = signal[:target_length, :]
+                            elif signal.shape[0] < target_length:
+                                # Pad with zeros to target length
+                                padding = np.zeros((target_length - signal.shape[0], signal.shape[1]))
+                                signal = np.vstack((signal, padding))
+                            
+                            # Add to dataset
+                            ecg_data.append(signal)
+                            
+                            # Get the exam ID
+                            exam_id = exam_ids[i]
+                            loaded_ids.append(exam_id)
+                    except Exception as e:
+                        print(f"Error processing record {i}: {e}")
+                        continue
+            
             # Try alternative known formats
             elif 'ecg' in hdf:
                 print("Found 'ecg' key - using alternative format")
                 all_tracings = np.array(hdf['ecg'])
-                # ... [process similarly to tracings]
+                print(f"Loaded ECG data with shape: {all_tracings.shape}")
                 
-            elif 'records' in hdf:
-                print("Found 'records' key - using records format")
-                records = hdf['records']
-                # Process records based on the structure...
+                # Process similar to 'tracings' format
+                n_records = all_tracings.shape[0]
+                print(f"Number of ECG records: {n_records}")
                 
+                # Generate sequential IDs
+                exam_ids = [i+1 for i in range(n_records)]
+                
+                # Loop through each record
+                for i in range(n_records):
+                    if (i+1) % 100 == 0 or i == n_records - 1:
+                        print(f"Processed {i+1}/{n_records} records")
+                    
+                    try:
+                        signal = all_tracings[i]
+                        
+                        # Adapt to the data shape
+                        if len(signal.shape) == 1:
+                            # Handle single-lead ECG
+                            signal = signal.reshape(-1, 1)
+                        
+                        # Check and standardize length
+                        target_length = 4000
+                        if signal.shape[0] > target_length:
+                            signal = signal[:target_length, :]
+                        elif signal.shape[0] < target_length:
+                            padding = np.zeros((target_length - signal.shape[0], signal.shape[1]))
+                            signal = np.vstack((signal, padding))
+                        
+                        ecg_data.append(signal)
+                        loaded_ids.append(i+1)
+                    except Exception as e:
+                        print(f"Error processing record {i}: {e}")
+                        continue
             else:
                 # Try standard HDF5 format where each key is an exam ID
                 exam_ids = list(hdf.keys())
@@ -127,11 +198,40 @@ def load_raw_data(df, sampling_rate, data_path):
                 # If no recognizable structure, try to inspect and adapt
                 if len(exam_ids) == 0:
                     print("No recognizable format found. File structure:")
-                    hdf.visit(lambda name: print(f"  - {name}"))
+                    def print_attrs(name, obj):
+                        print(f"  - {name}: {type(obj)}")
+                        if isinstance(obj, h5py.Dataset):
+                            print(f"    Shape: {obj.shape}, Dtype: {obj.dtype}")
+                    hdf.visititems(print_attrs)
                 else:
-                    # Proceed with existing code for standard format...
-                    # ... [rest of the existing standard format code]
-    
+                    # Process using exam IDs as keys
+                    for i, exam_id in enumerate(exam_ids):
+                        if (i+1) % 100 == 0:
+                            print(f"Loaded {i+1}/{len(exam_ids)} records")
+                        
+                        try:
+                            # Get ECG data
+                            signal = np.array(hdf[exam_id])
+                            
+                            # Ensure 2D array (samples x leads)
+                            if len(signal.shape) == 1:
+                                signal = signal.reshape(-1, 1)
+                            
+                            # Check if shape makes sense for ECG data
+                            if signal.shape[1] <= 12:  # Up to 12 leads
+                                # Standardize to a fixed length
+                                target_length = 4000
+                                if signal.shape[0] > target_length:
+                                    signal = signal[:target_length, :]
+                                elif signal.shape[0] < target_length:
+                                    padding = np.zeros((target_length - signal.shape[0], signal.shape[1]))
+                                    signal = np.vstack((signal, padding))
+                                
+                                ecg_data.append(signal)
+                                loaded_ids.append(exam_id)
+                        except Exception as e:
+                            print(f"Error loading ECG for exam_id {exam_id}: {e}")
+                            continue
     except Exception as e:
         print(f"Error opening HDF5 file: {e}")
         print("Traceback:")
@@ -141,6 +241,7 @@ def load_raw_data(df, sampling_rate, data_path):
     print(f"Successfully loaded {len(ecg_data)} ECG records with IDs")
     
     return np.array(ecg_data), np.array(loaded_ids)
+
 def clean_scp_codes(dicts):
     """
     Placeholder function to match team_code.py structure.
@@ -263,6 +364,13 @@ def train_model(data_directory, model_directory, verbose=1):
             print(f"  Directory: {root}")
             for file in files:
                 print(f"    File: {file}")
+                
+        # Try to list files that might contain ECG data
+        print("Searching for potential ECG data files:")
+        for root, dirs, files in os.walk(data_directory):
+            for file in files:
+                if file.endswith('.hdf5') or file.endswith('.h5') or file.endswith('.mat'):
+                    print(f"  Potential data file found: {os.path.join(root, file)}")
         
         # Try to continue with default path, but it will likely fail
         hdf5_path = os.path.join(data_directory, 'exams.hdf5')
@@ -288,6 +396,25 @@ def train_model(data_directory, model_directory, verbose=1):
         
         if not os.path.exists(chagas_labels_path):
             print(f"Warning: Labels file not found. Checked paths: {alternative_paths}")
+            
+            # Try to find any CSV file that might contain labels
+            print("Searching for potential labels files:")
+            for root, dirs, files in os.walk(data_directory):
+                for file in files:
+                    if file.endswith('.csv'):
+                        csv_path = os.path.join(root, file)
+                        print(f"  Potential labels file found: {csv_path}")
+                        
+                        # Try to peek at the file to see if it contains relevant columns
+                        try:
+                            df_peek = pd.read_csv(csv_path, nrows=5)
+                            print(f"    Columns: {list(df_peek.columns)}")
+                            if 'exam_id' in df_peek.columns:
+                                print(f"    This file contains 'exam_id' column and might be useful")
+                                if not chagas_labels_path or not os.path.exists(chagas_labels_path):
+                                    chagas_labels_path = csv_path
+                        except Exception as e:
+                            print(f"    Error peeking at CSV: {e}")
     
     if verbose >= 1:
         print(f"Using labels file: {chagas_labels_path}")
@@ -304,18 +431,135 @@ def train_model(data_directory, model_directory, verbose=1):
     
     if len(X) == 0:
         print("Error: No ECG data loaded. Please check the file paths.")
-        # Check if the data format might be different
-        print("Trying to determine available data files format...")
-        
-        # Try to list files that might contain ECG data
-        for root, dirs, files in os.walk(data_directory):
-            for file in files:
-                if file.endswith('.hdf5') or file.endswith('.h5') or file.endswith('.mat'):
-                    print(f"  Potential data file found: {os.path.join(root, file)}")
-        
         return
     
+    # Create labels for the loaded IDs
+    if verbose >= 1:
+        print('Creating Chagas labels...')
+    y = create_chagas_related_labels(loaded_ids, chagas_labels_path)
     
+    if verbose >= 1:
+        print('Preparing data...')
+    # Prepare and standardize data
+    X_train, X_val, y_train, y_val, scaler = prepare_data(X, y)
+    
+    # Save the scaler for use during inference
+    np.save(os.path.join(model_directory, 'scaler_mean.npy'), scaler.mean_)
+    np.save(os.path.join(model_directory, 'scaler_scale.npy'), scaler.scale_)
+    
+    # Define input shape
+    input_shape = (X_train.shape[1], X_train.shape[2])
+    
+    if verbose >= 1:
+        print('Training model...')
+    # Build and train the model
+    model = build_cnn_model(input_shape)
+    
+    if verbose >= 2:
+        # Print model summary with higher verbosity
+        model.summary()
+    
+    # Define callbacks
+    callbacks = []
+    
+    # Always use early stopping for best performance
+    early_stopping = tf.keras.callbacks.EarlyStopping(
+        monitor='val_auc',
+        patience=10,
+        mode='max',
+        restore_best_weights=True,
+        verbose=1 if verbose >= 1 else 0
+    )
+    callbacks.append(early_stopping)
+    
+    # Add model checkpoint to save the best model
+    model_checkpoint = tf.keras.callbacks.ModelCheckpoint(
+        os.path.join(model_directory, 'best_model.h5'),
+        monitor='val_auc',
+        mode='max',
+        save_best_only=True,
+        verbose=1 if verbose >= 1 else 0
+    )
+    callbacks.append(model_checkpoint)
+    
+    # Add learning rate reduction
+    reduce_lr = tf.keras.callbacks.ReduceLROnPlateau(
+        monitor='val_loss',
+        factor=0.5,
+        patience=5,
+        min_lr=1e-6,
+        verbose=1 if verbose >= 1 else 0
+    )
+    callbacks.append(reduce_lr)
+    
+    # Calculate class weights for imbalanced data
+    class_weight = None
+    if np.sum(y_train == 0) > 0 and np.sum(y_train == 1) > 0:
+        weight_for_0 = 1.0
+        weight_for_1 = np.sum(y_train == 0) / np.sum(y_train == 1)
+        class_weight = {0: weight_for_0, 1: weight_for_1}
+        if verbose >= 1:
+            print(f"Using class weights: {class_weight}")
+    
+    # Train the model
+    history = model.fit(
+        X_train, y_train,
+        validation_data=(X_val, y_val),
+        epochs=50,
+        batch_size=32,
+        callbacks=callbacks,
+        class_weight=class_weight,
+        verbose=1 if verbose >= 1 else 0
+    )
+    
+    if verbose >= 1:
+        print('Saving model...')
+    # Save the final model
+    model.save(os.path.join(model_directory, 'chagas_cnn_model.h5'))
+    
+    # Plot and save training history
+    plt.figure(figsize=(15, 5))
+    
+    plt.subplot(1, 3, 1)
+    plt.plot(history.history['loss'], label='Training Loss')
+    plt.plot(history.history['val_loss'], label='Validation Loss')
+    plt.title('Loss')
+    plt.xlabel('Epoch')
+    plt.legend()
+    
+    plt.subplot(1, 3, 2)
+    plt.plot(history.history['accuracy'], label='Training Accuracy')
+    plt.plot(history.history['val_accuracy'], label='Validation Accuracy')
+    plt.title('Accuracy')
+    plt.xlabel('Epoch')
+    plt.legend()
+    
+    plt.subplot(1, 3, 3)
+    plt.plot(history.history['auc'], label='Training AUC')
+    plt.plot(history.history['val_auc'], label='Validation AUC')
+    plt.title('AUC')
+    plt.xlabel('Epoch')
+    plt.legend()
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(model_directory, 'training_history.png'))
+    
+    # Evaluate on validation set
+    y_pred_prob = model.predict(X_val, verbose=0)
+    y_pred = (y_pred_prob > 0.5).astype(int)
+    
+    # Print and save classification report
+    if verbose >= 1:
+        print("\nValidation Set Performance:")
+        report = classification_report(y_val, y_pred)
+        print(report)
+        
+        with open(os.path.join(model_directory, 'classification_report.txt'), 'w') as f:
+            f.write(report)
+    
+    if verbose >= 1:
+        print('Done training model.')
+
 def load_model(model_directory, verbose=1):
     """
     Load trained model from model_directory.
