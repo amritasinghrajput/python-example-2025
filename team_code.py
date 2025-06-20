@@ -1,8 +1,3 @@
-#!/usr/bin/env python
-
-# Required packages:
-# pip install numpy wfdb tensorflow scikit-learn scipy
-
 import os
 import numpy as np
 import tensorflow as tf
