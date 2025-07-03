@@ -1,8 +1,3 @@
-#!/usr/bin/env python
-
-# Advanced Chagas disease detection model v3 - COMPLETED
-# Enhanced clinical feature extraction and improved architecture
-
 import os
 import numpy as np
 import pandas as pd
@@ -1552,12 +1547,13 @@ def save_advanced_model(model_folder, model, scaler, verbose):
         if verbose:
             print(f"Error saving model: {e}")
 
-def run_model(model_folder, data_folder, verbose):
+# PhysioNet Challenge required functions
+def load_model(model_folder, verbose):
     """
-    Run the trained model for inference
+    Load the trained model for inference (PhysioNet Challenge required function)
     """
     if verbose:
-        print("Running advanced Chagas detection model...")
+        print("Loading advanced Chagas detection model...")
     
     try:
         # Load model components
@@ -1566,9 +1562,7 @@ def run_model(model_folder, data_folder, verbose):
         metadata_path = os.path.join(model_folder, 'model_metadata.json')
         
         if not all(os.path.exists(path) for path in [model_path, scaler_path]):
-            if verbose:
-                print("Model files not found, training new model...")
-            train_model(data_folder, model_folder, verbose)
+            raise FileNotFoundError("Model files not found")
         
         # Load model
         model = tf.keras.models.load_model(model_path)
@@ -1589,6 +1583,26 @@ def run_model(model_folder, data_folder, verbose):
         if verbose:
             print("Advanced model loaded successfully")
             print(f"Model version: {metadata.get('model_version', 'unknown')}")
+        
+        return {'model': model, 'scaler': scaler, 'metadata': metadata}
+        
+    except Exception as e:
+        if verbose:
+            print(f"Model loading failed: {e}")
+        return None
+
+def run_model(model, data_folder, verbose):
+    """
+    Run the trained model for inference (PhysioNet Challenge required function)
+    """
+    if verbose:
+        print("Running advanced Chagas detection model...")
+    
+    try:
+        # Extract model components
+        keras_model = model['model']
+        scaler = model['scaler']
+        metadata = model['metadata']
         
         # Find test records
         records = find_records(data_folder)
@@ -1615,7 +1629,7 @@ def run_model(model_folder, data_folder, verbose):
                 clinical_input_scaled = scaler.transform(clinical_input)
                 
                 # Predict
-                prob = model.predict([signal_input, clinical_input_scaled], verbose=0)[0][0]
+                prob = keras_model.predict([signal_input, clinical_input_scaled], verbose=0)[0][0]
                 pred = 1 if prob > 0.5 else 0
                 
                 predictions.append(pred)
@@ -1637,14 +1651,32 @@ def run_model(model_folder, data_folder, verbose):
     except Exception as e:
         if verbose:
             print(f"Model inference failed: {e}")
-        return [0] * len(find_records(data_folder)), [0.0] * len(find_records(data_folder))
+        # Return default predictions if all else fails
+        records = find_records(data_folder)
+        return [0] * len(records), [0.0] * len(records)
+
+# Legacy function for backward compatibility
+def run_model_legacy(model_folder, data_folder, verbose):
+    """
+    Legacy run_model function for backward compatibility
+    """
+    # Load model first
+    model = load_model(model_folder, verbose)
+    if model is None:
+        if verbose:
+            print("Model loading failed, training new model...")
+        train_model(data_folder, model_folder, verbose)
+        model = load_model(model_folder, verbose)
+    
+    # Run inference
+    return run_model(model, data_folder, verbose)
 
 # Main execution functions
 if __name__ == "__main__":
     import sys
     
     if len(sys.argv) < 3:
-        print("Usage: python chagas_detection.py <data_folder> <model_folder> [verbose]")
+        
         sys.exit(1)
     
     data_folder = sys.argv[1]
@@ -1654,8 +1686,9 @@ if __name__ == "__main__":
     # Train model
     train_model(data_folder, model_folder, verbose)
     
-    # Run inference
-    predictions, probabilities = run_model(model_folder, data_folder, verbose)
-    
-    print(f"Final results: {len(predictions)} predictions made")
-    print(f"Chagas detection rate: {sum(predictions)/len(predictions)*100:.1f}%")
+    # Load and run inference
+    model = load_model(model_folder, verbose)
+    if model:
+        predictions, probabilities = run_model(model, data_folder, verbose)
+        print(f"Final results: {len(predictions)} predictions made")
+        print(f"Chagas detection rate: {sum(predictions)/len(predictions)*100:.1f}%")
