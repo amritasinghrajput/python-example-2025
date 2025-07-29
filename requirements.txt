@@ -17,6 +17,7 @@ tensorflow>=2.10.0,<2.16.0
 # System and compatibility
 setuptools>=65.0.0
 wheel>=0.37.0
+pywavelets>=1.3.0
 
 # Optional dependencies for enhanced functionality
 # pandas>=1.3.0  # For data analysis (if needed)
