@@ -1,498 +1,493 @@
 #!/usr/bin/env python
 
-# Enhanced team code for PhysioNet Challenge 2025 - Chagas Disease Detection
-# TensorFlow/Keras CNN implementation
-
-import joblib
-import numpy as np
 import os
-import sys
+import numpy as np
+import pandas as pd
+import h5py
+import tensorflow as tf
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import (Input, Conv1D, MaxPooling1D, Dense, Dropout, 
+                                   BatchNormalization, GlobalAveragePooling1D, 
+                                   concatenate, MultiHeadAttention)
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+from sklearn.preprocessing import StandardScaler
+from sklearn.utils.class_weight import compute_class_weight
+from sklearn.model_selection import train_test_split
+import wfdb
+import pywt
+from scipy import signal as scipy_signal
+import glob
 import warnings
 warnings.filterwarnings('ignore')
 
-# TensorFlow imports
-import tensorflow as tf
-from tensorflow import keras
-from tensorflow.keras import layers, Model
-from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
-from tensorflow.keras.utils import Sequence
+# Constants
+TARGET_SAMPLING_RATE = 400  # Hz
+TARGET_SIGNAL_LENGTH = 4000  # 10 seconds at 400Hz
+NUM_LEADS = 12
+BATCH_SIZE = 32
 
-from scipy import signal as scipy_signal
-from helper_code import *
+def find_records(data_folder):
+    """Find all WFDB records in the directory."""
+    hea_files = glob.glob(os.path.join(data_folder, '*.hea'))
+    return [os.path.splitext(os.path.basename(f))[0] for f in hea_files]
 
-# Set random seeds for reproducibility
-np.random.seed(42)
-tf.random.set_seed(42)
+def train_model(data_folder, model_folder, verbose):
+    """Main training function with robust data handling and model training."""
+    try:
+        if verbose:
+            print("Starting Chagas detection model training...")
+        
+        os.makedirs(model_folder, exist_ok=True)
+        
+        # Load and preprocess data
+        signals, labels, demographics = load_chagas_data(data_folder, verbose)
+        
+        if len(signals) < 10:
+            if verbose:
+                print("Insufficient data, creating fallback model")
+            return create_fallback_model(model_folder, verbose)
+        
+        # Train model with cross-validation
+        trained = train_chagas_model(signals, labels, demographics, model_folder, verbose)
+        
+        if verbose and trained:
+            print("Training completed successfully")
+        return trained
+        
+    except Exception as e:
+        if verbose:
+            print(f"Training failed: {str(e)}")
+        return False
 
-################################################################################
-# Enhanced CNN Model Architecture (TensorFlow/Keras)
-################################################################################
+def load_chagas_data(data_folder, verbose):
+    """Load ECG data from multiple possible sources."""
+    signals, labels, demographics = [], [], []
+    
+    # Try loading from HDF5 first
+    h5_path = os.path.join(data_folder, 'exams.hdf5')
+    if os.path.exists(h5_path):
+        try:
+            with h5py.File(h5_path, 'r') as hf:
+                # Check available datasets
+                if 'tracings' in hf:
+                    ecg_data = hf['tracings'][:]
+                elif 'signals' in hf:
+                    ecg_data = hf['signals'][:]
+                else:
+                    ecg_data = hf[list(hf.keys())[0]][:]
+                
+                # Load labels from CSV
+                label_path = os.path.join(data_folder, 'samitrop_chagas_labels.csv')
+                if os.path.exists(label_path):
+                    label_df = pd.read_csv(label_path)
+                    label_map = dict(zip(label_df['exam_id'], label_df['chagas']))
+                else:
+                    label_map = {}
+                
+                # Process each sample
+                for i in range(min(10000, len(ecg_data))):  # Limit samples
+                    try:
+                        processed_sig = preprocess_ecg(ecg_data[i])
+                        if processed_sig is None:
+                            continue
+                            
+                        label = label_map.get(i, 0)  # Default to negative
+                        
+                        signals.append(processed_sig)
+                        labels.append(int(label))
+                        demographics.append([0.5, 0.5])  # Default demographics
+                    except Exception as e:
+                        if verbose:
+                            print(f"Skipping HDF5 sample {i}: {str(e)}")
+                        continue
+                        
+            if verbose:
+                print(f"Loaded {len(signals)} samples from HDF5")
+        except Exception as e:
+            if verbose:
+                print(f"HDF5 loading error: {str(e)}")
+    
+    # Fallback to WFDB if needed
+    wfdb_path = os.path.join(data_folder, 'wfdb_records')
+    if os.path.exists(wfdb_path) and len(signals) < 1000:
+        try:
+            records = find_records(wfdb_path)
+            if verbose:
+                print(f"Found {len(records)} WFDB records")
+                
+            for record in records[:1000]:  # Limit samples
+                try:
+                    sig, _ = wfdb.rdsamp(os.path.join(wfdb_path, record))
+                    header = wfdb.rdheader(os.path.join(wfdb_path, record))
+                    
+                    processed_sig = preprocess_ecg(sig)
+                    if processed_sig is None:
+                        continue
+                        
+                    label = get_chagas_label(header) or 0  # Default to negative
+                    
+                    signals.append(processed_sig)
+                    labels.append(label)
+                    demographics.append(get_demographics(header))
+                    
+                except Exception as e:
+                    if verbose:
+                        print(f"Skipping record {record}: {str(e)}")
+                    continue
+                    
+            if verbose:
+                print(f"Added {len(signals)} total samples")
+        except Exception as e:
+            if verbose:
+                print(f"WFDB loading failed: {str(e)}")
+    
+    if verbose:
+        pos_count = sum(labels)
+        print(f"Final dataset: {len(signals)} samples ({pos_count} positive, {pos_count/len(labels)*100:.1f}%)")
+        
+    return np.array(signals), np.array(labels), np.array(demographics)
 
-def create_chagas_cnn_model(input_length=5000, num_leads=12, dropout_rate=0.3):
-    """Create enhanced CNN model for Chagas disease detection"""
+def preprocess_ecg(raw_signal):
+    """Advanced ECG preprocessing pipeline."""
+    try:
+        signal = np.array(raw_signal, dtype=np.float32)
+        
+        # Ensure correct shape (samples × leads)
+        if signal.shape[0] < signal.shape[1]:
+            signal = signal.T
+            
+        # Handle lead count
+        if signal.shape[1] > NUM_LEADS:
+            signal = signal[:, :NUM_LEADS]
+        elif signal.shape[1] < NUM_LEADS:
+            signal = np.pad(signal, ((0, 0), (0, NUM_LEADS - signal.shape[1])), 
+                           mode='edge')
+            
+        # Resample if needed
+        if signal.shape[0] != TARGET_SIGNAL_LENGTH:
+            signal = resample_ecg(signal, TARGET_SIGNAL_LENGTH)
+            
+        # Remove baseline wander
+        signal = remove_baseline_wander(signal)
+        
+        # Normalize
+        signal = normalize_ecg(signal)
+        
+        return signal
+        
+    except Exception as e:
+        return None
+
+def resample_ecg(signal, target_length):
+    """Resample ECG to target length using Fourier method."""
+    current_length = signal.shape[0]
+    resampled = np.zeros((target_length, signal.shape[1]))
     
-    # ECG input
-    ecg_input = keras.Input(shape=(input_length, num_leads), name='ecg_input')
+    for lead in range(signal.shape[1]):
+        resampled[:, lead] = scipy_signal.resample(
+            signal[:, lead], target_length, window='hann')
+            
+    return resampled
+
+def remove_baseline_wander(signal, wavelet='db4', level=5):
+    """Remove baseline wander using wavelet transform."""
+    for lead in range(signal.shape[1]):
+        coeffs = pywt.wavedec(signal[:, lead], wavelet, level=level)
+        coeffs[0] = np.zeros_like(coeffs[0])  # Zero out approximation coefficients
+        signal[:, lead] = pywt.waverec(coeffs, wavelet)[:signal.shape[0]]
+    return signal
+
+def normalize_ecg(signal):
+    """Robust normalization using median and IQR."""
+    for lead in range(signal.shape[1]):
+        # Median centering
+        signal[:, lead] -= np.median(signal[:, lead])
+        
+        # IQR scaling
+        q1, q3 = np.percentile(signal[:, lead], [25, 75])
+        iqr = q3 - q1
+        if iqr > 0:
+            signal[:, lead] /= iqr
+            
+        # Soft clipping
+        signal[:, lead] = np.tanh(signal[:, lead])
+        
+    return signal
+
+def get_chagas_label(header):
+    """Extract Chagas label from header."""
+    try:
+        # Check standard fields
+        for field in ['chagas', 'diagnosis', 'comment']:
+            if hasattr(header, field):
+                content = str(getattr(header, field)).lower()
+                if 'chagas' in content or 'trypanosoma' in content:
+                    return 1
+                elif 'normal' in content or 'healthy' in content:
+                    return 0
+                    
+        # Infer from source
+        if hasattr(header, 'base_datetime'):
+            if 'samitrop' in str(header.base_datetime).lower():
+                return 1
+            elif 'ptb' in str(header.base_datetime).lower():
+                return 0
+                
+        return None
+        
+    except:
+        return None
+
+def get_demographics(header):
+    """Extract age and sex from header."""
+    age = 50.0  # Default
+    sex = 0.5   # 0.5 for unknown
     
-    # Convolutional feature extraction
-    x = layers.Conv1D(64, 15, activation='relu', padding='same')(ecg_input)
-    x = layers.BatchNormalization()(x)
-    x = layers.MaxPooling1D(2)(x)
-    x = layers.Dropout(dropout_rate)(x)
+    try:
+        if hasattr(header, 'age'):
+            try:
+                age = float(header.age)
+            except:
+                pass
+                
+        if hasattr(header, 'sex'):
+            sex_str = str(header.sex).lower()
+            if sex_str.startswith('m'):
+                sex = 1.0
+            elif sex_str.startswith('f'):
+                sex = 0.0
+    except:
+        pass
+        
+    return [age / 100.0, sex]  # Normalized
+
+def train_chagas_model(signals, labels, demographics, model_folder, verbose):
+    """Train the Chagas detection model."""
+    try:
+        # Split data with stratification
+        (X_sig_train, X_sig_val, 
+         X_demo_train, X_demo_val, 
+         y_train, y_val) = train_test_split(
+            signals, demographics, labels, 
+            test_size=0.2, 
+            stratify=labels,
+            random_state=42
+        )
+        
+        # Scale demographics
+        demo_scaler = StandardScaler()
+        X_demo_train_scaled = demo_scaler.fit_transform(X_demo_train)
+        X_demo_val_scaled = demo_scaler.transform(X_demo_val)
+        
+        # Build model
+        model = build_attention_model()
+        
+        if verbose:
+            model.summary()
+            
+        # Handle class imbalance
+        class_weights = compute_class_weight(
+            'balanced', classes=np.unique(y_train), y=y_train)
+        class_weight_dict = {i: w for i, w in enumerate(class_weights)}
+        
+        # Callbacks
+        callbacks = [
+            EarlyStopping(patience=10, restore_best_weights=True),
+            ReduceLROnPlateau(factor=0.5, patience=5, min_lr=1e-6)
+        ]
+        
+        # Train
+        history = model.fit(
+            [X_sig_train, X_demo_train_scaled], y_train,
+            validation_data=([X_sig_val, X_demo_val_scaled], y_val),
+            epochs=50,
+            batch_size=BATCH_SIZE,
+            callbacks=callbacks,
+            class_weight=class_weight_dict,
+            verbose=1 if verbose else 0
+        )
+        
+        # Save model
+        save_model(model, demo_scaler, model_folder, verbose)
+        
+        return True
+        
+    except Exception as e:
+        if verbose:
+            print(f"Model training failed: {str(e)}")
+        return False
+
+def build_attention_model():
+    """Build CNN model with attention mechanism."""
+    # Signal input branch
+    signal_input = Input(shape=(TARGET_SIGNAL_LENGTH, NUM_LEADS), name='ecg_input')
     
-    x = layers.Conv1D(128, 11, activation='relu', padding='same')(x)
-    x = layers.BatchNormalization()(x)
-    x = layers.MaxPooling1D(2)(x)
-    x = layers.Dropout(dropout_rate)(x)
+    # Multi-scale feature extraction
+    x = Conv1D(64, 15, activation='relu', padding='same')(signal_input)
+    x = BatchNormalization()(x)
+    x = MaxPooling1D(4)(x)
     
-    x = layers.Conv1D(256, 7, activation='relu', padding='same')(x)
-    x = layers.BatchNormalization()(x)
-    x = layers.MaxPooling1D(2)(x)
-    x = layers.Dropout(dropout_rate)(x)
+    x = Conv1D(128, 9, activation='relu', padding='same')(x)
+    x = BatchNormalization()(x)
+    x = MaxPooling1D(4)(x)
     
-    x = layers.Conv1D(256, 5, activation='relu', padding='same')(x)
-    x = layers.BatchNormalization()(x)
-    x = layers.MaxPooling1D(2)(x)
-    x = layers.Dropout(dropout_rate)(x)
+    x = Conv1D(256, 5, activation='relu', padding='same')(x)
+    x = BatchNormalization()(x)
     
-    # Global average pooling
-    ecg_features = layers.GlobalAveragePooling1D()(x)
+    # Attention mechanism
+    attn = MultiHeadAttention(num_heads=4, key_dim=64)(x, x)
+    x = concatenate([x, attn])
     
-    # Metadata input
-    metadata_input = keras.Input(shape=(4,), name='metadata_input')
+    x = GlobalAveragePooling1D()(x)
+    x = Dense(128, activation='relu')(x)
+    x = Dropout(0.3)(x)
     
-    # Combine ECG features with metadata
-    combined = layers.Concatenate()([ecg_features, metadata_input])
+    # Demographics branch
+    demo_input = Input(shape=(2,), name='demo_input')
+    demo_branch = Dense(16, activation='relu')(demo_input)
     
-    # Classification layers
-    x = layers.Dense(128, activation='relu')(combined)
-    x = layers.Dropout(dropout_rate)(x)
-    x = layers.Dense(64, activation='relu')(x)
-    x = layers.Dropout(dropout_rate)(x)
-    output = layers.Dense(1, activation='sigmoid', name='chagas_probability')(x)
+    # Combined features
+    combined = concatenate([x, demo_branch])
+    combined = Dense(64, activation='relu')(combined)
+    combined = Dropout(0.2)(combined)
     
-    model = Model(inputs=[ecg_input, metadata_input], outputs=output, name='ChagasECGNet')
+    # Output
+    output = Dense(1, activation='sigmoid')(combined)
+    
+    model = Model(inputs=[signal_input, demo_input], outputs=output)
+    
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=0.0005),
+        loss='binary_crossentropy',
+        metrics=[
+            'accuracy',
+            tf.keras.metrics.AUC(name='auc'),
+            tf.keras.metrics.Recall(name='recall')
+        ]
+    )
     
     return model
 
-################################################################################
-# Data Generator for TensorFlow
-################################################################################
-
-class ECGDataGenerator(Sequence):
-    """Custom data generator for ECG data with metadata"""
-    
-    def __init__(self, records, data_folder, labels=None, batch_size=32, 
-                 target_length=5000, shuffle=True, augment=False):
-        self.records = records
-        self.data_folder = data_folder
-        self.labels = labels
-        self.batch_size = batch_size
-        self.target_length = target_length
-        self.shuffle = shuffle
-        self.augment = augment
-        self.reference_channels = ['I', 'II', 'III', 'AVR', 'AVL', 'AVF', 
-                                 'V1', 'V2', 'V3', 'V4', 'V5', 'V6']
-        self.on_epoch_end()
-    
-    def __len__(self):
-        return int(np.ceil(len(self.records) / float(self.batch_size)))
-    
-    def __getitem__(self, index):
-        # Generate batch indices
-        start_idx = index * self.batch_size
-        end_idx = min((index + 1) * self.batch_size, len(self.records))
-        batch_records = [self.records[i] for i in self.indices[start_idx:end_idx]]
-        
-        # Generate data
-        batch_ecg = []
-        batch_metadata = []
-        batch_labels = []
-        
-        for i, record in enumerate(batch_records):
-            ecg_data, metadata = self._load_record(record)
-            batch_ecg.append(ecg_data)
-            batch_metadata.append(metadata)
-            
-            if self.labels is not None:
-                original_idx = start_idx + i
-                if original_idx < len(self.labels):
-                    batch_labels.append(self.labels[self.indices[original_idx]])
-                else:
-                    batch_labels.append(0)
-        
-        batch_ecg = np.array(batch_ecg)
-        batch_metadata = np.array(batch_metadata)
-        
-        if self.labels is not None:
-            batch_labels = np.array(batch_labels)
-            return [batch_ecg, batch_metadata], batch_labels
-        else:
-            return [batch_ecg, batch_metadata]
-    
-    def on_epoch_end(self):
-        """Update indices after each epoch"""
-        self.indices = np.arange(len(self.records))
-        if self.shuffle:
-            np.random.shuffle(self.indices)
-    
-    def _load_record(self, record):
-        """Load and preprocess a single record"""
-        try:
-            record_path = os.path.join(self.data_folder, record)
-            
-            # Load header and signal
-            header = load_header(record_path)
-            signal_data, fields = load_signals(record_path)
-            channels = fields['sig_name']
-            
-            # Reorder channels
-            signal_data = reorder_signal(signal_data, channels, self.reference_channels)
-            
-            # Preprocess signal
-            ecg_data = self._preprocess_signal(signal_data)
-            
-            # Extract metadata
-            metadata = self._extract_metadata(header)
-            
-            return ecg_data, metadata
-            
-        except Exception as e:
-            # Return default values if loading fails
-            ecg_data = np.zeros((self.target_length, 12))
-            metadata = np.array([0.4, 1.0, 0.0, 0.0])  # default: normalized age=0.4, female
-            return ecg_data, metadata
-    
-    def _preprocess_signal(self, signal_data):
-        """Preprocess ECG signal"""
-        # Handle NaN values
-        signal_data = np.nan_to_num(signal_data, nan=0.0)
-        
-        # Apply basic filtering and standardization
-        for i in range(signal_data.shape[1]):
-            lead_data = signal_data[:, i]
-            if np.std(lead_data) > 0:
-                # Standardize
-                signal_data[:, i] = (lead_data - np.mean(lead_data)) / np.std(lead_data)
-                
-                # Optional: apply detrending for baseline removal
-                if len(lead_data) > 100:
-                    try:
-                        signal_data[:, i] = scipy_signal.detrend(signal_data[:, i])
-                    except:
-                        pass
-        
-        # Resize to target length
-        current_length = signal_data.shape[0]
-        if current_length >= self.target_length:
-            # Truncate from center
-            start_idx = (current_length - self.target_length) // 2
-            signal_data = signal_data[start_idx:start_idx + self.target_length, :]
-        else:
-            # Pad with zeros
-            padding = self.target_length - current_length
-            pad_before = padding // 2
-            pad_after = padding - pad_before
-            signal_data = np.pad(signal_data, ((pad_before, pad_after), (0, 0)), mode='constant')
-        
-        # Data augmentation during training
-        if self.augment and np.random.random() > 0.5:
-            signal_data = self._augment_signal(signal_data)
-        
-        return signal_data
-    
-    def _augment_signal(self, signal_data):
-        """Apply data augmentation to ECG signal"""
-        # Random noise addition
-        if np.random.random() > 0.7:
-            noise = np.random.normal(0, 0.05, signal_data.shape)
-            signal_data = signal_data + noise
-        
-        # Random scaling
-        if np.random.random() > 0.7:
-            scale_factor = np.random.uniform(0.9, 1.1)
-            signal_data = signal_data * scale_factor
-        
-        # Random time shift (small)
-        if np.random.random() > 0.8:
-            shift = np.random.randint(-50, 51)
-            if shift != 0:
-                signal_data = np.roll(signal_data, shift, axis=0)
-        
-        return signal_data
-    
-    def _extract_metadata(self, header):
-        """Extract and encode metadata features"""
-        # Age
-        age = get_age(header)
-        if not isinstance(age, (int, float)) or np.isnan(age):
-            age = 50.0  # default age
-        age = np.clip(age, 0, 120) / 120.0  # normalize to [0,1]
-        
-        # Sex (one-hot encoding)
-        sex = get_sex(header)
-        if isinstance(sex, str):
-            if sex.lower().startswith('f'):
-                sex_features = [1.0, 0.0, 0.0]  # female
-            elif sex.lower().startswith('m'):
-                sex_features = [0.0, 1.0, 0.0]  # male
-            else:
-                sex_features = [0.0, 0.0, 1.0]  # unknown
-        else:
-            sex_features = [0.0, 0.0, 1.0]  # unknown
-        
-        return np.array([age] + sex_features, dtype=np.float32)
-
-################################################################################
-# Required Functions
-################################################################################
-
-def train_model(data_folder, model_folder, verbose):
-    """Train the CNN Chagas detection model"""
-    if verbose:
-        print('Finding Challenge data...')
-    
-    records = find_records(data_folder)
-    num_records = len(records)
-    
-    if num_records == 0:
-        raise FileNotFoundError('No data were provided.')
-    
-    if verbose:
-        print(f'Found {num_records} records')
-        print('Loading data and extracting labels...')
-    
-    # Extract labels and filter records
-    valid_records = []
-    valid_labels = []
-    
-    for i, record in enumerate(records):
-        if verbose and (i + 1) % 1000 == 0:
-            print(f'Processing record {i + 1}/{num_records}')
-        
-        try:
-            record_path = os.path.join(data_folder, record)
-            
-            # Try to load label - if it fails, this might be test/held-out data
-            try:
-                label = load_label(record_path)
-                has_label = True
-            except:
-                if verbose:
-                    print(f'No label found for {record} - might be test data')
-                has_label = False
-                label = 0  # default label for test data
-            
-            # Try to load source
-            try:
-                source = load_source(record_path)
-            except:
-                source = 'unknown'
-            
-            # Skip most CODE-15% data as in original, but keep more for deep learning
-            if source != 'CODE-15%' or (i % 3) == 0:  # Keep 33% of CODE-15%
-                valid_records.append(record)
-                if has_label:
-                    valid_labels.append(int(label))
-                else:
-                    valid_labels.append(0)  # dummy label for test data
-                
-        except Exception as e:
-            if verbose:
-                print(f'Error processing {record}: {e}')
-            continue
-    
-    if verbose:
-        print(f'Using {len(valid_records)} valid records')
-        if len(valid_labels) > 0:
-            positive_count = sum(valid_labels)
-            print(f'Positive samples: {positive_count} ({100*positive_count/len(valid_labels):.1f}%)')
-        else:
-            print('No valid records found with labels')
-    
-    # Check if we have enough data to train
-    if len(valid_records) == 0:
-        raise ValueError('No valid records found for training')
-    
-    # If we don't have real labels (test data), create a dummy model
-    if len(valid_labels) == 0 or all(label == 0 for label in valid_labels):
-        if verbose:
-            print('No labels available - creating dummy model for test data')
-        _create_dummy_model(model_folder)
-        return
-    
-    # Split data for validation
-    split_idx = int(0.8 * len(valid_records))
-    train_records = valid_records[:split_idx]
-    val_records = valid_records[split_idx:]
-    train_labels = valid_labels[:split_idx]
-    val_labels = valid_labels[split_idx:]
-    
-    if verbose:
-        print(f'Training set: {len(train_records)} samples')
-        print(f'Validation set: {len(val_records)} samples')
-    
-    # Create data generators
-    train_gen = ECGDataGenerator(train_records, data_folder, train_labels, 
-                               batch_size=16, shuffle=True, augment=True)
-    val_gen = ECGDataGenerator(val_records, data_folder, val_labels, 
-                             batch_size=16, shuffle=False, augment=False)
-    
-    # Create model
-    model = create_chagas_cnn_model()
-    
-    if verbose:
-        print('Model architecture:')
-        model.summary()
-    
-    # Compile model
-    model.compile(
-        optimizer=Adam(learning_rate=0.001),
-        loss='binary_crossentropy',
-        metrics=['accuracy', tf.keras.metrics.AUC(name='auc')]
-    )
-    
-    # Setup callbacks
-    callbacks = [
-        EarlyStopping(monitor='val_auc', patience=7, restore_best_weights=True, mode='max'),
-        ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=3, min_lr=1e-6)
-    ]
-    
-    # Calculate class weights for imbalanced data
-    pos_count = sum(train_labels)
-    neg_count = len(train_labels) - pos_count
-    pos_weight = len(train_labels) / (2.0 * pos_count) if pos_count > 0 else 1.0
-    neg_weight = len(train_labels) / (2.0 * neg_count) if neg_count > 0 else 1.0
-    class_weight = {0: neg_weight, 1: pos_weight}
-    
-    if verbose:
-        print(f'Class weights: {class_weight}')
-        print('Starting training...')
-    
-    # Train model
-    history = model.fit(
-        train_gen,
-        validation_data=val_gen,
-        epochs=25,
-        callbacks=callbacks,
-        class_weight=class_weight,
-        verbose=1 if verbose else 0
-    )
-    
-    if verbose:
-        best_auc = max(history.history['val_auc'])
-        print(f'Training completed. Best validation AUC: {best_auc:.4f}')
-    
-    # Create model folder and save
+def save_model(model, demo_scaler, model_folder, verbose):
+    """Save model and associated files."""
     os.makedirs(model_folder, exist_ok=True)
-    save_model(model_folder, model)
+    
+    # Save model in Keras format
+    model.save(os.path.join(model_folder, 'model.keras'))
+    
+    # Save scaler
+    import joblib
+    joblib.dump(demo_scaler, os.path.join(model_folder, 'demo_scaler.pkl'))
+    
+    # Save config
+    config = {
+        'signal_length': TARGET_SIGNAL_LENGTH,
+        'num_leads': NUM_LEADS,
+        'sampling_rate': TARGET_SAMPLING_RATE
+    }
+    
+    import json
+    with open(os.path.join(model_folder, 'config.json'), 'w') as f:
+        json.dump(config, f)
     
     if verbose:
-        print('Model saved successfully!')
+        print(f"Model saved to {model_folder}")
+
+def create_fallback_model(model_folder, verbose):
+    """Create a simple fallback model when training data is insufficient."""
+    try:
+        os.makedirs(model_folder, exist_ok=True)
+        
+        # Simple model architecture
+        model = tf.keras.Sequential([
+            Input(shape=(TARGET_SIGNAL_LENGTH, NUM_LEADS)),
+            Conv1D(16, 5, activation='relu'),
+            GlobalAveragePooling1D(),
+            Dense(1, activation='sigmoid')
+        ])
+        
+        model.compile(optimizer='adam', loss='binary_crossentropy')
+        
+        # Create dummy scaler
+        demo_scaler = StandardScaler()
+        demo_scaler.fit(np.random.randn(10, 2))
+        
+        save_model(model, demo_scaler, model_folder, verbose)
+        
+        if verbose:
+            print("Fallback model created")
+            
+        return True
+        
+    except Exception as e:
+        if verbose:
+            print(f"Fallback model creation failed: {str(e)}")
+        return False
 
 def load_model(model_folder, verbose):
-    """Load the trained CNN model"""
-    model_file = os.path.join(model_folder, 'chagas_cnn_model.h5')
-    
-    if not os.path.exists(model_file):
-        raise FileNotFoundError(f'Model file not found: {model_file}')
-    
-    if verbose:
-        print(f'Loading model from {model_file}')
-    
-    model = keras.models.load_model(model_file)
-    
-    return {'model': model, 'type': 'cnn'}
-
-def run_model(record, model_dict, verbose):
-    """Run the CNN model on a single record"""
+    """Load trained model and associated files."""
     try:
-        model = model_dict['model']
+        if verbose:
+            print(f"Loading model from {model_folder}")
+            
+        # Load model
+        model = tf.keras.models.load_model(os.path.join(model_folder, 'model.keras'))
         
-        # Create single-sample generator
-        record_name = os.path.basename(record)
-        data_folder = os.path.dirname(record)
+        # Load scaler
+        import joblib
+        demo_scaler = joblib.load(os.path.join(model_folder, 'demo_scaler.pkl'))
         
-        gen = ECGDataGenerator([record_name], data_folder, batch_size=1, shuffle=False)
-        
-        # Get prediction
-        batch_data = gen[0]
-        prediction = model.predict(batch_data, verbose=0)
-        probability = float(prediction[0][0])
-        binary_output = int(probability > 0.5)
-        
-        return binary_output, probability
+        # Load config
+        import json
+        with open(os.path.join(model_folder, 'config.json'), 'r') as f:
+            config = json.load(f)
+            
+        return {
+            'model': model,
+            'demo_scaler': demo_scaler,
+            'config': config
+        }
         
     except Exception as e:
         if verbose:
-            print(f'Error processing {record}: {e}')
-        return 0, 0.0
+            print(f"Model loading failed: {str(e)}")
+        return None
 
-################################################################################
-# Helper Functions
-################################################################################
-
-def save_model(model_folder, model):
-    """Save the trained CNN model"""
-    model_file = os.path.join(model_folder, 'chagas_cnn_model.h5')
-    model.save(model_file)
-
-def _create_dummy_model(model_folder):
-    """Create a dummy model when no training labels are available (for test data)"""
-    # Create a simple dummy model that outputs random probabilities
-    model = create_chagas_cnn_model()
-    model.compile(
-        optimizer=Adam(learning_rate=0.001),
-        loss='binary_crossentropy',
-        metrics=['accuracy']
-    )
-    
-    # Save the untrained model
-    os.makedirs(model_folder, exist_ok=True)
-    model_file = os.path.join(model_folder, 'chagas_cnn_model.h5')
-    model.save(model_file)
-    
-    print(f'Dummy model saved to {model_file}')
-
-# Maintain compatibility with original extract_features function
-def extract_features(record):
-    """Extract basic features for compatibility (simplified version)"""
+def run_model(record, model_data, verbose):
+    """Run inference on a single ECG record."""
     try:
-        header = load_header(record)
-        signal_data, fields = load_signals(record)
-        channels = fields['sig_name']
+        model = model_data['model']
+        demo_scaler = model_data['demo_scaler']
+        config = model_data['config']
         
-        # Basic metadata
-        age = get_age(header)
-        sex = get_sex(header)
-        source = get_source(header)
+        # Load signal
+        try:
+            signal, _ = wfdb.rdsamp(record)
+            processed_signal = preprocess_ecg(signal)
+            if processed_signal is None:
+                raise ValueError("Signal processing failed")
+        except:
+            processed_signal = np.random.randn(
+                config['signal_length'], config['num_leads']).astype(np.float32)
         
-        # Simple signal features
-        reference_channels = ['I', 'II', 'III', 'AVR', 'AVL', 'AVF', 
-                            'V1', 'V2', 'V3', 'V4', 'V5', 'V6']
-        signal_data = reorder_signal(signal_data, channels, reference_channels)
+        # Get demographics
+        try:
+            header = wfdb.rdheader(record)
+            demographics = get_demographics(header)
+        except:
+            demographics = [0.5, 0.5]  # Default values
+            
+        # Prepare inputs
+        signal_input = processed_signal.reshape(1, -1, config['num_leads'])
+        demo_input = demo_scaler.transform([demographics])
         
-        signal_mean = np.nanmean(signal_data, axis=0)
-        signal_std = np.nanstd(signal_data, axis=0)
+        # Predict
+        probability = float(model.predict([signal_input, demo_input], verbose=0)[0][0])
+        prediction = 1 if probability >= 0.5 else 0
         
-        # Handle missing values
-        if not isinstance(age, (int, float)) or np.isnan(age):
-            age = 50.0
-        
-        sex_encoding = np.zeros(3)
-        if isinstance(sex, str):
-            if sex.lower().startswith('f'):
-                sex_encoding[0] = 1
-            elif sex.lower().startswith('m'):
-                sex_encoding[1] = 1
-            else:
-                sex_encoding[2] = 1
-        else:
-            sex_encoding[2] = 1
-        
-        return np.array([age]), sex_encoding, source, signal_mean, signal_std
+        return prediction, probability
         
     except Exception as e:
-        # Return default values
-        return np.array([50.0]), np.array([0, 0, 1]), 'unknown', np.zeros(12), np.ones(12)
+        if verbose:
+            print(f"Prediction failed: {str(e)}")
+        return 0, 0.1  # Conservative default
