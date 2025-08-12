@@ -364,7 +364,7 @@ def augment_ecg_signal(signal):
 
 def train_robust_model(signals, labels, model_folder, verbose):
     """
-    Train robust ECG-only model
+    Train robust ECG-only model with improved performance
     """
     if verbose:
         print(f"Training on {len(signals)} ECG samples")
@@ -378,93 +378,312 @@ def train_robust_model(signals, labels, model_folder, verbose):
         unique, counts = np.unique(y, return_counts=True)
         print(f"Label distribution: {dict(zip(unique, counts))}")
     
-    # Handle class imbalance with augmentation
-    if len(np.unique(y)) == 1 or np.min(np.bincount(y)) < 50:
+    # Enhanced data augmentation for minority class
+    if len(np.unique(y)) == 2:
+        minority_class = np.argmin(np.bincount(y))
+        majority_class = 1 - minority_class
+        
+        # More aggressive augmentation to balance classes
+        minority_indices = np.where(y == minority_class)[0]
+        majority_count = np.sum(y == majority_class)
+        minority_count = len(minority_indices)
+        
+        if minority_count < majority_count:
+            # Create multiple augmented versions
+            augment_factor = min(4, majority_count // minority_count)
+            
+            augmented_X = [X]
+            augmented_y = [y]
+            
+            for factor in range(augment_factor):
+                for idx in minority_indices:
+                    # Multiple augmentation strategies
+                    base_signal = X[idx]
+                    
+                    # Strategy 1: Noise + amplitude scaling
+                    aug1 = base_signal.copy()
+                    noise_level = 0.02 + 0.03 * np.random.random()
+                    aug1 += np.random.normal(0, noise_level, aug1.shape)
+                    aug1 *= np.random.uniform(0.85, 1.15)
+                    
+                    # Strategy 2: Time warping simulation
+                    aug2 = base_signal.copy()
+                    shift = np.random.randint(-15, 16)
+                    aug2 = np.roll(aug2, shift, axis=0)
+                    aug2 *= np.random.uniform(0.9, 1.1)
+                    
+                    augmented_X.extend([aug1.reshape(1, *aug1.shape), aug2.reshape(1, *aug2.shape)])
+                    augmented_y.extend([[minority_class], [minority_class]])
+            
+            X = np.vstack(augmented_X)
+            y = np.hstack(augmented_y)
+            
+            if verbose:
+                unique_new, counts_new = np.unique(y, return_counts=True)
+                print(f"After augmentation: {dict(zip(unique_new, counts_new))}")
+    
+    # Handle single class case
+    elif len(np.unique(y)) == 1:
         if verbose:
-            print("Handling severe class imbalance with augmentation")
-        X, y = balance_with_augmentation(X, y, verbose)
+            print("Single class detected - creating synthetic opposite class")
+        original_class = unique[0]
+        synthetic_count = len(X) // 2
+        
+        synthetic_X = []
+        for i in range(synthetic_count):
+            idx = np.random.choice(len(X))
+            synthetic_signal = X[idx].copy()
+            
+            # More aggressive synthetic data generation
+            synthetic_signal += np.random.normal(0, 0.15, synthetic_signal.shape)
+            synthetic_signal *= np.random.uniform(0.7, 1.3)
+            
+            # Add some systematic differences
+            synthetic_signal = np.roll(synthetic_signal, np.random.randint(-20, 21), axis=0)
+            
+            synthetic_X.append(synthetic_signal)
+        
+        X = np.vstack([X, np.array(synthetic_X)])
+        y = np.hstack([y, np.full(synthetic_count, 1 - original_class)])
     
-    # Split data
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=y
-    )
+    # Improved train-validation split with better stratification
+    try:
+        X_train, X_val, y_train, y_val = train_test_split(
+            X, y, test_size=0.25, random_state=42, stratify=y
+        )
+    except ValueError:
+        # If stratification fails, use random split
+        X_train, X_val, y_train, y_val = train_test_split(
+            X, y, test_size=0.25, random_state=42
+        )
     
-    # Build model
-    model = build_ecg_model(X.shape[1:])
+    # Build model with improved architecture
+    model = build_enhanced_ecg_model(X.shape[1:])
     
     if verbose:
-        print("Model architecture:")
+        print("Enhanced model architecture:")
         model.summary()
     
-    # Compile
+    # Improved compilation with better optimizer settings
+    initial_learning_rate = 0.002
     model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
+        optimizer=tf.keras.optimizers.Adam(
+            learning_rate=initial_learning_rate,
+            beta_1=0.9,
+            beta_2=0.999,
+            epsilon=1e-7
+        ),
         loss='binary_crossentropy',
-        metrics=['accuracy', AUC(name='auc')]
+        metrics=['accuracy', 'precision', 'recall', AUC(name='auc')]
     )
     
-    # Class weights
-    try:
-        class_weights = compute_class_weight('balanced', classes=np.unique(y_train), y=y_train)
-        class_weight_dict = {i: weight for i, weight in enumerate(class_weights)}
-        if verbose:
-            print(f"Class weights: {class_weight_dict}")
-    except:
+    # Enhanced class weights calculation
+    if len(np.unique(y_train)) > 1:
+        try:
+            class_weights = compute_class_weight('balanced', classes=np.unique(y_train), y=y_train)
+            # Adjust weights to be more conservative
+            class_weight_dict = {}
+            for i, weight in enumerate(class_weights):
+                # Cap extreme weights and apply smoothing
+                adjusted_weight = min(weight, 5.0) if weight > 1 else max(weight, 0.2)
+                class_weight_dict[i] = adjusted_weight
+            
+            if verbose:
+                print(f"Adjusted class weights: {class_weight_dict}")
+        except:
+            class_weight_dict = {0: 1.0, 1: 1.0}
+    else:
         class_weight_dict = None
     
-    # Callbacks
+    # Enhanced callbacks with better monitoring
     callbacks = [
         EarlyStopping(
             monitor='val_auc',
-            patience=20,
+            patience=25,  # Increased patience
             restore_best_weights=True,
-            mode='max'
+            mode='max',
+            min_delta=0.001  # Minimum improvement threshold
         ),
         ReduceLROnPlateau(
             monitor='val_auc',
-            factor=0.5,
-            patience=10,
-            min_lr=1e-6,
+            factor=0.6,  # Less aggressive reduction
+            patience=12,  # More patience before reducing
+            min_lr=1e-7,
             mode='max',
-            verbose=1 if verbose else 0
+            verbose=1 if verbose else 0,
+            cooldown=5  # Cooldown period
         )
     ]
     
-    # Train
+    # Training with improved parameters
     history = model.fit(
         X_train, y_train,
-        validation_data=(X_test, y_test),
-        epochs=25,
-        batch_size=BATCH_SIZE,
+        validation_data=(X_val, y_val),
+        epochs=40,  # Increased epochs
+        batch_size=min(BATCH_SIZE, len(X_train) // 4),  # Adaptive batch size
         callbacks=callbacks,
         class_weight=class_weight_dict,
-        verbose=1 if verbose else 0
+        verbose=1 if verbose else 0,
+        shuffle=True
     )
     
-    # Evaluate
+    # Enhanced evaluation
     if verbose:
-        y_pred = model.predict(X_test, verbose=0)
-        y_pred_binary = (y_pred > 0.5).astype(int).flatten()
+        y_pred_prob = model.predict(X_val, verbose=0)
         
-        print("\nTest Set Evaluation:")
-        print(classification_report(y_test, y_pred_binary))
+        # Try multiple thresholds to find optimal
+        thresholds = [0.3, 0.4, 0.5, 0.6, 0.7]
+        best_f1 = 0
+        best_threshold = 0.5
+        
+        for threshold in thresholds:
+            y_pred_binary = (y_pred_prob > threshold).astype(int).flatten()
+            
+            try:
+                from sklearn.metrics import f1_score
+                f1 = f1_score(y_val, y_pred_binary, average='weighted')
+                if f1 > best_f1:
+                    best_f1 = f1
+                    best_threshold = threshold
+            except:
+                continue
+        
+        print(f"\nBest threshold: {best_threshold} (F1: {best_f1:.4f})")
+        
+        # Final evaluation with best threshold
+        y_pred_final = (y_pred_prob > best_threshold).astype(int).flatten()
+        
+        print("\nValidation Set Evaluation:")
+        print(classification_report(y_val, y_pred_final))
         print("Confusion Matrix:")
-        print(confusion_matrix(y_test, y_pred_binary))
+        print(confusion_matrix(y_val, y_pred_final))
         
         try:
-            auc_score = roc_auc_score(y_test, y_pred)
+            auc_score = roc_auc_score(y_val, y_pred_prob)
             print(f"AUC Score: {auc_score:.4f}")
         except:
             pass
     
-    # Save model
-    save_model_files(model_folder, model, verbose)
+    # Save model with enhanced configuration
+    save_enhanced_model_files(model_folder, model, best_threshold if 'best_threshold' in locals() else 0.5, verbose)
     
     if verbose:
-        print("Model training completed")
+        print("Enhanced model training completed")
     
     return True
 
+
+def build_enhanced_ecg_model(input_shape):
+    """
+    Build enhanced ECG classification model with better architecture
+    """
+    def squeeze_excite_block(x, ratio=16):
+        """Squeeze and Excitation block for channel attention"""
+        filters = x.shape[-1]
+        se = GlobalAveragePooling1D()(x)
+        se = Dense(filters // ratio, activation='relu')(se)
+        se = Dense(filters, activation='sigmoid')(se)
+        se = tf.keras.layers.Reshape((1, filters))(se)
+        return tf.keras.layers.Multiply()([x, se])
+    
+    def enhanced_residual_block(x, filters, kernel_size=7, stride=1, se_ratio=16):
+        shortcut = x
+        
+        # First conv with depthwise separable convolution for efficiency
+        x = Conv1D(filters, kernel_size, strides=stride, padding='same',
+                  kernel_regularizer=tf.keras.regularizers.l2(1e-4))(x)
+        x = BatchNormalization()(x)
+        x = ReLU()(x)
+        x = SpatialDropout1D(0.1)(x)
+        
+        # Second conv
+        x = Conv1D(filters, kernel_size, strides=1, padding='same',
+                  kernel_regularizer=tf.keras.regularizers.l2(1e-4))(x)
+        x = BatchNormalization()(x)
+        
+        # Squeeze and Excitation
+        if se_ratio > 0:
+            x = squeeze_excite_block(x, se_ratio)
+        
+        # Shortcut connection
+        if shortcut.shape[-1] != filters or stride != 1:
+            shortcut = Conv1D(filters, 1, strides=stride, padding='same')(shortcut)
+            shortcut = BatchNormalization()(shortcut)
+        
+        x = Add()([x, shortcut])
+        x = ReLU()(x)
+        return x
+    
+    # Input
+    inputs = Input(shape=input_shape)
+    
+    # Initial processing with larger kernel to capture more context
+    x = Conv1D(64, 21, strides=2, padding='same',
+               kernel_regularizer=tf.keras.regularizers.l2(1e-4))(inputs)
+    x = BatchNormalization()(x)
+    x = ReLU()(x)
+    x = SpatialDropout1D(0.1)(x)
+    
+    # Enhanced residual blocks with attention
+    x = enhanced_residual_block(x, 64, 15, stride=1, se_ratio=16)
+    x = enhanced_residual_block(x, 96, 13, stride=2, se_ratio=16)
+    x = enhanced_residual_block(x, 96, 11, stride=1, se_ratio=16)
+    x = enhanced_residual_block(x, 128, 9, stride=2, se_ratio=16)
+    x = enhanced_residual_block(x, 128, 7, stride=1, se_ratio=16)
+    x = enhanced_residual_block(x, 192, 5, stride=2, se_ratio=16)
+    x = enhanced_residual_block(x, 192, 3, stride=1, se_ratio=16)
+    
+    # Multi-scale feature extraction
+    # Global Average Pooling
+    gap = GlobalAveragePooling1D()(x)
+    
+    # Global Max Pooling for different feature emphasis
+    gmp = tf.keras.layers.GlobalMaxPooling1D()(x)
+    
+    # Combine features
+    combined = tf.keras.layers.Concatenate()([gap, gmp])
+    
+    # Enhanced classification head with better regularization
+    x = Dense(256, activation='relu',
+              kernel_regularizer=tf.keras.regularizers.l2(1e-4))(combined)
+    x = Dropout(0.4)(x)
+    x = Dense(128, activation='relu',
+              kernel_regularizer=tf.keras.regularizers.l2(1e-4))(x)
+    x = Dropout(0.3)(x)
+    x = Dense(64, activation='relu',
+              kernel_regularizer=tf.keras.regularizers.l2(1e-4))(x)
+    x = Dropout(0.2)(x)
+    
+    outputs = Dense(1, activation='sigmoid')(x)
+    
+    model = Model(inputs, outputs)
+    return model
+
+
+def save_enhanced_model_files(model_folder, model, threshold, verbose):
+    """
+    Save model and enhanced configuration
+    """
+    # Save model
+    model.save(os.path.join(model_folder, 'model.keras'))
+    
+    # Save enhanced config
+    config = {
+        'signal_length': TARGET_SIGNAL_LENGTH,
+        'num_leads': NUM_LEADS,
+        'sampling_rate': TARGET_SAMPLING_RATE,
+        'model_type': 'enhanced_ecg',
+        'threshold': threshold,  # Use optimized threshold
+        'version': '2.0'
+    }
+    
+    import json
+    with open(os.path.join(model_folder, 'config.json'), 'w') as f:
+        json.dump(config, f)
+    
+    if verbose:
+        print(f"Enhanced model saved to {model_folder}")
+      
 def balance_with_augmentation(X, y, verbose):
     """
     Balance dataset using augmentation
