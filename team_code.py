@@ -13,7 +13,7 @@ from tensorflow.keras.layers import (Dense, Dropout, Conv1D, Input,
                                    BatchNormalization, GlobalAveragePooling1D, 
                                    ReLU, Add, SpatialDropout1D)
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
-from tensorflow.keras.metrics import AUC
+from tensorflow.keras.metrics import AUC, Precision, Recall  # Fixed: Import metric classes
 from sklearn.model_selection import train_test_split
 from sklearn.utils.class_weight import compute_class_weight
 from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score
@@ -474,7 +474,7 @@ def train_robust_model(signals, labels, model_folder, verbose):
             epsilon=1e-7
         ),
         loss='binary_crossentropy',
-        metrics=['accuracy', 'precision', 'recall', AUC(name='auc')]
+        metrics=['accuracy', Precision(), Recall(), AUC(name='auc')]  # Fixed: Use metric classes
     )
     
     # Enhanced class weights calculation
